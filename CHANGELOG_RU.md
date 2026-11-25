@@ -1,10 +1,23 @@
+# Доработка отчётности USB Exchange
+
+- Анализ USBPcap по умолчанию начинается с первой packet record; `--skip-host-packets` имеет значение по умолчанию `0`.
+- Журнал обмена строится по фактическим payload из USBPcap: слева Host → Device, справа Device → Host. Для Control IN/OUT направление data stage определяется по `bmRequestType`, для endpoint-трафика — по адресу Endpoint.
+- Для каждой USBPcap записи сохраняются `dataLength` и фактически захваченная длина payload; расхождение показывается с номером кадра.
+- Убраны формулировки «байты не извлечены»; отсутствие payload в самом захвате обозначается отдельно и не подменяется байтами из профиля.
+- Повторяющиеся `DEVICE_IN_TRANSFER_COMPLETE` сводятся в счётчик на Case; полный счётчик событий также хранится в JSON.
+- Основной HTML показывает краткий двухколоночный журнал; подробная диагностика и сравнение скрыты в раскрываемом разделе.
+- Параметры dry-run и реального запуска в README задаются один раз через `COMMON_ARGS`.
+- Версия JSON-отчёта обновлена до `report_version: 5`.
+
+---
+
 # Изменения отчётности (рабочая доработка)
 
 - Добавлен направленный журнал USBPcap для каждого Case: Host → Device слева, Device → Host справа.
 - Control Transfers показывают Setup Packet в HEX и расшифрованные bmRequestType, bRequest, wValue, wIndex, wLength; GET_DESCRIPTOR-ответы дополнительно декодируются по типу дескриптора.
 - Bulk, Interrupt и Isochronous Transfers выводятся отдельными блоками с HEX-данными, Endpoint, направлением, кадрами, IRP ID и статусом.
 - Отсутствующие/усечённые данные и неподтверждённый completion отмечаются явно; нулевые байты вместо отсутствующего payload не подставляются.
-- JSON-схема отчёта обновлена до report_version 4 и содержит usb_exchange_log для каждого Case.
+- JSON-схема отчёта обновлена до report_version 5 и содержит usb_exchange_log для каждого Case.
 
 ---
 
@@ -15,7 +28,7 @@
 - Подробная побайтовая проверка дескрипторов, Raw Gadget trace, SET_CONFIGURATION, endpoint/control transfers и HEX остаются внутри карточки.
 - Общий инвентарь USBPcap перенесён в отдельный сворачиваемый раздел.
 - Сохранены исходные JSON/TXT-отчёты и структура данных; изменено только представление HTML.
-- Первые шесть packet records по-прежнему исключаются до разбора.
+- Анализ PCAPNG начинается с первой packet record.
 
 # Изменения
 
@@ -33,7 +46,7 @@
 ## v0.5.11 — прямой USBPcap parser и последовательная корреляция без часов
 
 - Для PCAPNG linktype 249 добавлен native parser USBPcap: точные offsets заголовка, Control Stage, `dataLength`, payload и `IRP ID`; TShark не нужен для этого формата.
-- Первые шесть исходных packet records пропускаются до разбора, без влияния на frame numbers последующих записей.
+- По умолчанию анализ начинается с первой исходной packet record.
 - Control/data URB сопоставляются по IRP ID; enumeration-сессии разделяются после успешно завершённого `SET_CONFIGURATION` при следующем `GET_DESCRIPTOR(Device)`.
 - Для USBPcap auto mode использует последовательное сопоставление case ↔ host-session по профильным отпечаткам и frame order; время Raspberry Pi/Windows не сравнивается.
 - Серийник считается прочитанным только при фактическом GET_DESCRIPTOR(String) нужного индекса. Отсутствующий запрос не трактуется как несовпадение.

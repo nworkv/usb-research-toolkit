@@ -39,6 +39,9 @@ out = module.build_html(report)
 assert '<details class="case good" open>' in out
 assert '<details class="global-details">' in out
 assert "Побайтовая проверка дескрипторов" in out
-assert "Данные endpoint/control после enumeration" in out
+assert "Дополнительное сравнение endpoint/control" in out
+assert '<details class="technical">' in out
+assert "байты отправки не извлечены" not in out.lower()
+assert "после исключения первых шести" not in out.lower()
 assert "Что Raw Gadget записал в trace" in out
 print("test_report_html_collapsible: PASS")

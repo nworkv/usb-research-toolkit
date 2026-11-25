@@ -306,7 +306,7 @@ def pcapng_linktypes(path: Path) -> list[int]:
     return result
 
 
-def read_usbpcap_pcapng_rows(path: Path, skip_packets: int = 6) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+def read_usbpcap_pcapng_rows(path: Path, skip_packets: int = 0) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Decode USBPcap linktype 249 directly; does not depend on TShark field names.
 
     Frame numbers stay one-based and refer to the original capture. The skip count
@@ -455,6 +455,7 @@ def read_usbpcap_pcapng_rows(path: Path, skip_packets: int = 6) -> tuple[list[di
             "usbpcap_header_len": header_len,
             "usbpcap_stage": stage,
             "payload_truncated": truncated,
+            "captured_payload_length": len(payload),
         }
         if transfer_type == 2 and stage == 3:
             row["control_response"] = hex_colon
@@ -480,7 +481,7 @@ def read_usbpcap_pcapng_rows(path: Path, skip_packets: int = 6) -> tuple[list[di
     return rows, meta
 
 
-def read_host_capture_rows(pcap: Path, tshark: str, skip_packets: int = 6) -> tuple[list[dict[str, Any]], list[str], dict[str, Any]]:
+def read_host_capture_rows(pcap: Path, tshark: str, skip_packets: int = 0) -> tuple[list[dict[str, Any]], list[str], dict[str, Any]]:
     """Prefer exact native USBPcap decoding; retain TShark fallback for other link types."""
     try:
         linktypes = pcapng_linktypes(pcap)
@@ -490,9 +491,8 @@ def read_host_capture_rows(pcap: Path, tshark: str, skip_packets: int = 6) -> tu
         rows, meta = read_usbpcap_pcapng_rows(pcap, skip_packets=skip_packets)
         return rows, ["USBPcap native fields (linktype 249)"], meta
     rows, fields = read_tshark_rows(pcap, tshark)
-    # The six-record exclusion is a capture-specific USBPcap rule, not a generic
-    # TShark rule. JSON/fake-tshark fixtures and unrelated link types must not
-    # silently lose their first six rows.
+    # Packet skipping is opt-in only. By default the report starts at the first
+    # packet record for every supported capture format.
     classic_linktype = None
     try:
         with pcap.open("rb") as stream:
@@ -1046,7 +1046,8 @@ def event_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
     config_values = [int(e.get("configuration_value") or 0) for e in events
                      if e.get("event") == "SET_CONFIGURATION" and e.get("configuration_value") is not None]
     return {
-        "event_counts": dict(sorted(counts.items())),
+         "event_counts": dict(sorted(counts.items())),
+        "device_in_transfer_complete_count": counts["DEVICE_IN_TRANSFER_COMPLETE"],
         "get_descriptor_requests": [e.get("request") for e in events
                                      if e.get("event") == "CONTROL_REQUEST" and
                                      isinstance(e.get("request"), dict) and int(e["request"].get("bRequest", -1)) == 6],
@@ -2024,7 +2025,7 @@ def reconcile_campaign_devices(campaign_rows: list[dict[str, Any]], inventory: d
 
 
 def host_inventory_html(inventory: dict[str, Any]) -> str:
-    out=[f'<p><b>Захват после отсечения первых пакетов:</b> control transfers={inventory["control_transfer_count"]}; GET_DESCRIPTOR={inventory["get_descriptor_count"]}. Первые шесть packet records исключены до декодирования.</p>']
+    out=[f'<p><b>Захват после отсечения первых пакетов:</b> control transfers={inventory["control_transfer_count"]}; GET_DESCRIPTOR={inventory["get_descriptor_count"]}. Анализ начинается с первой packet record.</p>']
     for dev in inventory.get("devices",[]):
         ids=dev.get("vid_pid",{})
         out.append(f'<h3>{html.escape(str(dev.get("session_id")))} — frames {html.escape(str(dev.get("first_frame")))}–{html.escape(str(dev.get("last_frame")))} — USB bus {html.escape(str(dev.get("bus_id")))} / address {html.escape(str(dev.get("device_address")))} — VID {html.escape(str(ids.get("vid") or "unknown"))} PID {html.escape(str(ids.get("pid") or "unknown"))} — serial {html.escape(str(dev.get("serial_number") or dev.get("serial_status")))} — {html.escape(str(dev.get("enumeration_status")))}</h3>')
@@ -2044,6 +2045,42 @@ def host_inventory_html(inventory: dict[str, Any]) -> str:
         out.append('<p class="missing">В захвате не восстановлено ни одного GET_DESCRIPTOR. Проверь USBPcap Root Hub и наличие completion/data stage.</p>')
     return ''.join(out)
 
+def exchange_payload_for_direction(group: dict[str, Any], transfer_type: int | None,
+                                    request: dict[str, Any] | None, endpoint: int | None) -> bytes | None:
+    """Select the USBPcap payload from the URB record that owns the data stage.
+
+    USBPcap commonly puts OUT data on the submit record and IN data on the
+    completion record. Control transfers use bmRequestType to determine the
+    data-stage direction. Never substitute profile/Raw Gadget bytes here.
+    """
+    rows = list(group.get("rows", []))
+    candidates: list[tuple[int, int, bytes]] = []
+    if transfer_type == 2 and request:
+        is_in = bool(int(request.get("bmRequestType", 0) or 0) & 0x80)
+        preferred = ("get_descriptor_response", "control_response", "data_fragment") if is_in else ("data_fragment", "capdata")
+        for row in rows:
+            for rank, field in enumerate(preferred):
+                raw = parse_hex_field(row.get(field))
+                if raw is not None:
+                    candidates.append((rank, -len(raw), raw))
+    else:
+        is_in = bool(endpoint is not None and (endpoint & 0x80))
+        preferred_class = "C" if is_in else "S"
+        for row in rows:
+            raw = parse_hex_field(row.get("capdata"))
+            if raw is None:
+                continue
+            row_class = urb_class(row.get("urb_type"))
+            rank = 0 if row_class == preferred_class else 1
+            candidates.append((rank, -len(raw), raw))
+    if candidates:
+        candidates.sort(key=lambda item: (item[0], item[1]))
+        return candidates[0][2]
+    # Legacy/fallback rows may not preserve field-specific payloads.
+    fallback = group.get("payload")
+    return fallback if isinstance(fallback, bytes) else None
+
+
 def make_usb_exchange_log(groups: list[dict[str, Any]], correlation_mode: str) -> list[dict[str, Any]]:
     """Build a loss-aware, directional Host<->Device log from USBPcap URB groups."""
     transfer_names = {0: "ISOCHRONOUS", 1: "INTERRUPT", 2: "CONTROL", 3: "BULK", 0xFE: "IRP_INFO"}
@@ -2055,7 +2092,7 @@ def make_usb_exchange_log(groups: list[dict[str, Any]], correlation_mode: str) -
         transfer_type = parse_int(group.get("transfer_type"))
         endpoint = parse_int(group.get("endpoint_address"))
         request = group.get("request") if isinstance(group.get("request"), dict) else None
-        payload = group.get("payload") if isinstance(group.get("payload"), bytes) else None
+        payload = exchange_payload_for_direction(group, transfer_type, request, endpoint)
         sent_parts: list[bytes] = []
         received_parts: list[bytes] = []
         sent_decoded: list[str] = []
@@ -2115,6 +2152,16 @@ def make_usb_exchange_log(groups: list[dict[str, Any]], correlation_mode: str) -
         # capture completeness, not a zero-length USB data packet.
         if transfer_type == 2 and not request and not payload and group.get("status") == "TEARDOWN_ABORT_PIPE":
             continue
+        sent_length = len(sent) if sent is not None else None
+        received_length = len(received) if received is not None else None
+        if transfer_type == 2 and request and int(request.get("wLength", 0) or 0) == 0:
+            received_length = 0
+        elif transfer_type in (0, 1, 3) and group.get("complete_seen") and all(
+                (parse_int(row.get("data_len")) or 0) == 0 for row in group.get("rows", [])):
+            if endpoint is not None and (endpoint & 0x80):
+                received_length = 0
+            else:
+                sent_length = 0
         result.append({
             "transfer_type": transfer_names.get(transfer_type, f"UNKNOWN_0x{transfer_type:02X}" if transfer_type is not None else "UNKNOWN"),
             "transfer_type_code": transfer_type,
@@ -2130,13 +2177,21 @@ def make_usb_exchange_log(groups: list[dict[str, Any]], correlation_mode: str) -
             "sent_hex": sent.hex() if sent is not None else None,
             "received_hex": received.hex() if received is not None else None,
             "unclassified_payload_hex": unclassified.hex() if unclassified is not None else None,
-            "sent_length": len(sent) if sent is not None else None,
-            "received_length": len(received) if received is not None else None,
+            "sent_length": sent_length,
+            "received_length": received_length,
             "sent_decoded": sent_decoded,
             "received_decoded": received_decoded,
             "status": group.get("status", "UNKNOWN"),
             "complete_seen": bool(group.get("complete_seen")),
             "payload_truncated": any(bool(row.get("payload_truncated")) for row in group.get("rows", [])),
+            "usbpcap_data_length": max((parse_int(row.get("data_len")) or 0 for row in group.get("rows", [])), default=0),
+            "captured_payload_length": len(payload) if payload is not None else 0,
+            "payload_capture_gaps": [
+                {"frame": row.get("frame_number"), "expected": parse_int(row.get("data_len")) or 0,
+                 "captured": parse_int(row.get("captured_payload_length")) or 0}
+                for row in group.get("rows", [])
+                if (parse_int(row.get("data_len")) or 0) > (parse_int(row.get("captured_payload_length")) or 0)
+            ],
             "status_details": group.get("status_details", []),
         })
     return result
@@ -2382,7 +2437,7 @@ def human_verdict(code: str) -> str:
         "NO_HOST_EVIDENCE_FOR_CASE": "НЕТ USB-НАБЛЮДЕНИЙ В ОКНЕ ЭТОГО СЛУЧАЯ",
         "HOST_DESCRIPTOR_BYTES_MISMATCH": "ОШИБКА: БАЙТЫ ДЕСКРИПТОРА В USBPcap НЕ СОВПАЛИ С ПРОФИЛЕМ",
         "HOST_TRANSFER_ERROR_OBSERVED": "НАБЛЮДАЛАСЬ ОШИБКА ПЕРЕДАЧИ ХОСТА — НУЖНА ПРОВЕРКА",
-        "HOST_RESPONSE_BYTES_UNAVAILABLE": "ЗАПРОС ВИДЕН, НО БАЙТЫ ОТВЕТА НЕ ИЗВЛЕЧЕНЫ",
+        "HOST_RESPONSE_BYTES_UNAVAILABLE": "ЗАПРОС ЕСТЬ, PAYLOAD ОТВЕТА ОТСУТСТВУЕТ В ЗАХВАТЕ",
         "HOST_REQUESTED_DESCRIPTOR_NOT_DEFINED_IN_PROFILE": "ХОСТ ЗАПРОСИЛ ДЕСКРИПТОР, НЕ ОПИСАННЫЙ В ПРОФИЛЕ",
         "EXPECTED_DESCRIPTOR_BYTES_MATCH_CONFIGURED_OBSERVED": "БАЙТЫ ДЕСКРИПТОРОВ СОВПАЛИ; CONFIGURED НАБЛЮДАЛСЯ НА ХОСТЕ И УСТРОЙСТВЕ",
         "EXPECTED_DESCRIPTOR_BYTES_MATCH_CONFIGURATION_PARTIAL": "БАЙТЫ ДЕСКРИПТОРОВ СОВПАЛИ; CONFIGURED ПОДТВЕРЖДЁН ТОЛЬКО ОДНИМ ИСТОЧНИКОМ",
@@ -2437,8 +2492,8 @@ def build_txt(report: dict[str, Any]) -> str:
             frames = ",".join(str(x) for x in tx.get("frames", [])) or "—"
             endpoint = f"0x{int(tx['endpoint_address']):02X}" if tx.get("endpoint_address") is not None else "EP0/неизвестен"
             lines.extend(["", f"  [{tx_no:04d}] {tx.get('transfer_type')} {tx.get('direction')} | EP={endpoint} | frames={frames} | IRP={tx.get('irp_id') or '—'} | status={tx.get('status')}"])
-            left = tx.get("sent_hex") or "<байты отправки не извлечены>"
-            right = tx.get("received_hex") or "<байты ответа не извлечены>"
+            left = tx.get("sent_hex") if tx.get("sent_hex") is not None else "—"
+            right = tx.get("received_hex") if tx.get("received_hex") is not None else "—"
             lines.append("      ОТПРАВЛЕНО  : " + left.upper())
             lines.append("      ПОЛУЧЕНО    : " + right.upper())
             if tx.get("unclassified_payload_hex"):
@@ -2449,13 +2504,18 @@ def build_txt(report: dict[str, Any]) -> str:
                 lines.extend("        Расшифровка полученного: " + x for x in tx["received_decoded"])
             if tx.get("payload_truncated"):
                 lines.append("        ВНИМАНИЕ: USBPcap отметил усечение payload.")
+            for gap in tx.get("payload_capture_gaps", []):
+                lines.append(f"        PAYLOAD GAP frame={gap.get('frame')}: USBPcap dataLength={gap.get('expected')} B, captured={gap.get('captured')} B")
             if not tx.get("complete_seen"):
                 lines.append("        ВНИМАНИЕ: completion URB в группе не подтверждён.")
         lines.append("")
         lines.append("Изменённые поля:")
         lines.extend("  " + str(x) for x in case.get("changes", [])) if case.get("changes") else lines.append("  (изменения не записаны в manifest)")
         ts = case["device_trace_summary"]
-        lines.append(f"Trace: requests={ts['control_request_count']}, responses={ts['control_response_complete_count']}, configured={ts['configured_observed']}, STALL={ts['stall_count']}, reset={ts['reset_count']}, disconnect={ts['disconnect_count']}, errors={ts['error_count']}")
+        pi_summary = f"Pi: CONTROL_REQUEST={ts['control_request_count']}; CONTROL_RESPONSE_COMPLETE={ts['control_response_complete_count']}; CONFIGURED={ts['configured_observed']}; STALL={ts['stall_count']}; RESET={ts['reset_count']}; DISCONNECT={ts['disconnect_count']}; ERROR={ts['error_count']}"
+        if ts.get("device_in_transfer_complete_count", 0):
+            pi_summary += f"; DEVICE_IN_TRANSFER_COMPLETE × {ts['device_in_transfer_complete_count']}"
+        lines.append(pi_summary)
         lines.append("GET_DESCRIPTOR, записанные Raw Gadget (payload trace — отдельное наблюдение, не PCAP):")
         if case.get("device_trace_descriptor_transactions"):
             for item in case["device_trace_descriptor_transactions"]:
@@ -2481,7 +2541,7 @@ def build_txt(report: dict[str, Any]) -> str:
                           "      " + (f"first diff offset: 0x{t['first_diff_offset']:04X}" if t.get("first_diff_offset") is not None and t['result'] == "MISMATCH" else "байтовое сравнение: " + t['result']),
                           "      PROFILE / EXPECTED (HEX):", "      " + (t.get("expected_hex") or "<не определено в профиле>"),
                           "      DEVICE TRACE / Raw Gadget payload (HEX):", "      " + (t.get("device_trace_payload_hex") or "<ответ не записан в trace или не сопоставлен>"),
-                          "      WINDOWS USBPcap / HOST OBSERVED (HEX):", "      " + (t.get("actual_hex") or "<байты не извлечены>"),
+                          "      WINDOWS USBPcap / HOST OBSERVED (HEX):", "      " + (t.get("actual_hex") or "<payload отсутствует в PCAP>"),
                           "      DEVICE TRACE vs PROFILE: " + str(t.get("expected_vs_device", {}).get("status", t.get("device_trace_result_vs_profile", "UNKNOWN"))),
                           "      USBPcap vs DEVICE TRACE: " + str(t.get("device_vs_host", {}).get("status", "UNKNOWN")),
                           "      THREE-WAY STATUS: " + str(t.get("three_way_status", "UNKNOWN")),
@@ -2507,7 +2567,7 @@ def build_txt(report: dict[str, Any]) -> str:
         for item in comparison.get("entries", []):
             lines.extend([f"  {item['name']} | {item['result']} | state={item['state']}",
                           f"    EXPECTED HEX: {item.get('expected_hex') or '<нет в профиле>'}",
-                          f"    HOST HEX:     {item.get('host_hex') or '<не получено>'}"])
+                          f"    HOST HEX:     {item.get('host_hex') or '<payload отсутствует в PCAP>'}"])
             lines.extend("    EXPECTED: " + x for x in item.get("expected_decoded", []))
             lines.extend("    HOST: " + x for x in item.get("host_decoded", []))
         if case.get("host_errors"):
@@ -2517,7 +2577,7 @@ def build_txt(report: dict[str, Any]) -> str:
             lines.extend(["", "DATA ENDPOINT / CONTROL PAYLOADS (TRACE TX/RX VS USBPcap):"])
             for x in case["correlated_data_transfers"]:
                 trace_hex = x.get("payload_hex") or x.get("payload_preview_hex") or "<не записано>"
-                host_hex = x.get("host_payload_hex") or "<не получено/не извлечено>"
+                host_hex = x.get("host_payload_hex") or "<payload отсутствует в PCAP>"
                 lines.append(f"  event={x.get('event')} endpoint=0x{int(x.get('endpoint_address',0)):02X} direction={x.get('direction')} result={x.get('comparison_status')} host_frames={x.get('host_frames')}")
                 lines.append(f"    PROFILE EXPECTED HEX: {x.get('expected_payload_hex') or '<не задано в профиле>'}")
                 lines.append(f"    DEVICE TRACE HEX:     {trace_hex}")
@@ -2535,7 +2595,7 @@ def build_txt(report: dict[str, Any]) -> str:
 
 def html_byte_dump(data: bytes | None, expected: bytes | None = None) -> str:
     if data is None:
-        return '<p class="missing">Байты ответа не извлечены из PCAPNG.</p>'
+        return '<p class="missing">В PCAPNG нет payload для этой записи.</p>'
     rows = []
     for base in range(0, len(data), 16):
         cells = []
@@ -2569,12 +2629,15 @@ def descriptor_html(t: dict[str, Any], index: int) -> str:
 
 
 def usb_exchange_html(tx: dict[str, Any], index: int) -> str:
-    def panel(title: str, hex_value: str | None, decoded: list[str], css: str, empty: str) -> str:
-        if hex_value:
+    def panel(title: str, hex_value: str | None, decoded: list[str], css: str, empty: str,
+              byte_length: int | None) -> str:
+        if hex_value is not None:
             try:
                 dump = html_byte_dump(bytes.fromhex(hex_value))
             except ValueError:
                 dump = f'<pre>{html.escape(hex_value)}</pre>'
+        elif byte_length == 0:
+            dump = '<p class="muted">0 B · data payload отсутствует по протоколу</p>'
         else:
             dump = f'<p class="missing">{html.escape(empty)}</p>'
         decoded_html = ''.join(f'<li>{html.escape(str(item))}</li>' for item in decoded)
@@ -2592,14 +2655,16 @@ def usb_exchange_html(tx: dict[str, Any], index: int) -> str:
         flags.append("completion URB не подтверждён")
     if tx.get("payload_truncated"):
         flags.append("payload усечён в захвате")
+    for gap in tx.get("payload_capture_gaps", []):
+        flags.append(f"frame {gap.get('frame')}: USBPcap dataLength={gap.get('expected')} B, captured={gap.get('captured')} B")
     if tx.get("unclassified_payload_hex"):
         flags.append("Control payload без сопоставленного SETUP: направление не определено")
     if flags:
         flags_html = '<p class="missing">' + html.escape("; ".join(flags)) + '</p>'
     else:
         flags_html = ''
-    left = panel("ОТПРАВЛЕНО · HOST → DEVICE", tx.get("sent_hex"), sent_decoded, "sent-pane", "Отправленные байты не извлечены из PCAPNG.")
-    right = panel("ПОЛУЧЕНО · DEVICE → HOST", tx.get("received_hex"), tx.get("received_decoded", []), "received-pane", "Ответные байты не извлечены из PCAPNG.")
+    left = panel("ОТПРАВЛЕНО · HOST → DEVICE", tx.get("sent_hex"), sent_decoded, "sent-pane", "Payload отсутствует в соответствующих USBPcap records.", tx.get("sent_length"))
+    right = panel("ПОЛУЧЕНО · DEVICE → HOST", tx.get("received_hex"), tx.get("received_decoded", []), "received-pane", "Payload отсутствует в соответствующих USBPcap records.", tx.get("received_length"))
     orphan_html = ''
     if tx.get("unclassified_payload_hex"):
         orphan_html = '<h4>CONTROL DATA · НАПРАВЛЕНИЕ НЕ ОПРЕДЕЛЕНО</h4>' + html_byte_dump(bytes.fromhex(tx["unclassified_payload_hex"]))
@@ -2616,23 +2681,27 @@ def build_html(report: dict[str, Any]) -> str:
             if case.get("host_session_match", {}).get("status") == "AMBIGUOUS":
                 descriptor_parts = '<p class="missing">Сессия PCAP есть, но её нельзя однозначно назначить конкретному Case по отпечатку профиля.</p>'
             else:
-                descriptor_parts = '<p class="missing">Для этого Case не найдена однозначная USB-сессия в PCAP после исключения первых шести пакетов.</p>'
+                descriptor_parts = '<p class="missing">Для этого Case не найдена однозначная USB-сессия в PCAP.</p>'
         unseen = [x for x in case.get("expected_descriptor_catalogue", []) if x.get("capture_state") == "NOT_OBSERVED_IN_PCAP"]
         unseen_html = ''.join(f'<details><summary>{html.escape(x["name"])} — ожидаемо, в PCAP не замечено</summary><pre>{html.escape(x["expected_hex"])}</pre>{html_byte_dump(bytes.fromhex(x["expected_hex"]))}</details>' for x in unseen)
         events = case["device_trace_summary"]
+        repeated_event_count = int(events.get("device_in_transfer_complete_count", 0) or 0)
+        repeated_event_suffix = f"; DEVICE_IN_TRANSFER_COMPLETE × {repeated_event_count}" if repeated_event_count else ""
         setcfg = ''.join(f'<li>value={x["value"]}; frames={html.escape(str(x["frames"]))}; transfer={html.escape(str(x["status"]))}; complete={x["complete_seen"]}; error={x["error"]}</li>' for x in case["host_set_configuration"]) or '<li>SET_CONFIGURATION не наблюдался в PCAP.</li>'
         exchange_log_html = ''.join(usb_exchange_html(tx, i) for i, tx in enumerate(case.get("usb_exchange_log", []), 1)) or '<p class="muted">Нет USBPcap-транзакций, однозначно назначенных этому Case.</p>'
         cards.append(f'''<details class="case {case_class}" open>
 <summary class="case-summary"><span class="case-title">CASE {case['case']:05d}</span><span class="pill {case_class}">{html.escape(human_verdict(case['verdict']))}</span><span class="muted">run={html.escape(case['run_status'])}; session={html.escape(str(case.get('host_session_id') or case.get('host_session_match', {}).get('status') or 'NOT_ASSIGNED'))}; host groups={case['host_groups_in_window']}</span></summary>
 <div class="case-exchange"><h3 class="exchange-title">CASE {case['case']:05d} — USB-ОБМЕН</h3>{exchange_log_html}</div>
-<div class="meta"><p><b>Профиль:</b> {html.escape(case['profile'])}</p><p><b>SHA-256:</b> <code>{html.escape(str(case.get('profile_sha256')))}</code></p><p><b>Trace:</b> {html.escape(str(case.get('trace')))}</p><p><b>События на Pi:</b> control requests={events['control_request_count']}, completed EP0={events['control_response_complete_count']}, CONFIGURED={events['configured_observed']}, STALL={events['stall_count']}, reset={events['reset_count']}, disconnect={events['disconnect_count']}, errors={events['error_count']}</p><p><b>Windows USBPcap:</b> реальные ошибки={len(case.get('host_errors', []))}; CANCELLED при остановке={len(case.get('host_cancellations', []))}; ABORT_PIPE teardown={len(case.get('host_teardown_events', []))}</p><p><b>Проверка байтов:</b> {html.escape(str(case.get('byte_correlation_status')))}</p>{''.join('<p class="missing">'+html.escape(str(w))+'</p>' for w in case.get('warnings', []))}</div>
+<details class="technical"><summary>Диагностика и сравнение</summary>
+<div class="meta"><p><b>Профиль:</b> {html.escape(case['profile'])}</p><p><b>SHA-256:</b> <code>{html.escape(str(case.get('profile_sha256')))}</code></p><p><b>Trace:</b> {html.escape(str(case.get('trace')))}</p><p><b>Pi:</b> CONTROL_REQUEST={events['control_request_count']}; CONTROL_RESPONSE_COMPLETE={events['control_response_complete_count']}; CONFIGURED={events['configured_observed']}; STALL={events['stall_count']}; RESET={events['reset_count']}; DISCONNECT={events['disconnect_count']} ; ERROR={events['error_count']}{repeated_event_suffix}</p><p><b>Windows USBPcap:</b> реальные ошибки={len(case.get('host_errors', []))}; CANCELLED при остановке={len(case.get('host_cancellations', []))}; ABORT_PIPE teardown={len(case.get('host_teardown_events', []))}</p><p><b>Проверка байтов:</b> {html.escape(str(case.get('byte_correlation_status')))}</p>{''.join('<p class="missing">'+html.escape(str(w))+'</p>' for w in case.get('warnings', []))}</div>
 <h3>Что изменено в этом профиле</h3><ul>{changes}</ul>
 <h3>Полная конфигурация: EXPECTED ↔ максимально восстановленная USBPcap</h3>{configuration_comparison_html(case.get("configuration_comparison", {}))}
 <h3>Что Raw Gadget записал в trace</h3><ul>{''.join(f'<li>{html.escape(str(x["name"]))}: trace={html.escape(str(x.get("result")))}, request seq={html.escape(str(x.get("request_sequence")))}, response seq={html.escape(str(x.get("response_sequence")))}, байт={html.escape(str(x.get("trace_length")))} / expected={html.escape(str(x.get("expected_length")))}</li>' for x in case.get("device_trace_descriptor_transactions", [])) or '<li>Нет завершённых ответов GET_DESCRIPTOR в trace.</li>'}</ul>
 <h3>События SET_CONFIGURATION в хостовом захвате</h3><ul>{setcfg}</ul>
 <h3>Побайтовая проверка дескрипторов: профиль → Raw Gadget → USBPcap</h3>{descriptor_parts}
-<h3>Данные endpoint/control после enumeration</h3>{''.join(f'<details><summary>{html.escape(str(x.get("event")))} endpoint=0x{int(x.get("endpoint_address",0)):02X} {html.escape(str(x.get("direction")))} — {html.escape(str(x.get("comparison_status")))}</summary><p>PROFILE EXPECTED HEX</p><pre>{html.escape(str(x.get("expected_payload_hex") or "НЕ ЗАДАНО В ПРОФИЛЕ"))}</pre><p>DEVICE TRACE HEX</p><pre>{html.escape(str(x.get("payload_hex") or x.get("payload_preview_hex") or "НЕ ЗАПИСАНО"))}</pre><p>WINDOWS USBPcap HEX</p><pre>{html.escape(str(x.get("host_payload_hex") or "НЕ ПОЛУЧЕНО / НЕ ИЗВЛЕЧЕНО"))}</pre><p>PROFILE vs TRACE={html.escape(str(x.get("expected_vs_trace_status")))}; frames={html.escape(str(x.get("host_frames")))}</p></details>' for x in case.get("correlated_data_transfers", [])) or '<p class="muted">Нет сопоставимых payload endpoint/control transfers в trace.</p>'}
-<h3>Ожидаемые дескрипторы, не замеченные в PCAP</h3>{unseen_html or '<p>Все ожидаемые ключи дескрипторов были замечены в захвате (это не гарантирует наличие данных по каждому запросу).</p>'}
+<h3>Дополнительное сравнение endpoint/control</h3>{''.join(f'<details><summary>{html.escape(str(x.get("event")))} endpoint=0x{int(x.get("endpoint_address",0)):02X} {html.escape(str(x.get("direction")))} — {html.escape(str(x.get("comparison_status")))}</summary><p>PROFILE EXPECTED HEX</p><pre>{html.escape(str(x.get("expected_payload_hex") or "НЕ ЗАДАНО В ПРОФИЛЕ"))}</pre><p>DEVICE TRACE HEX</p><pre>{html.escape(str(x.get("payload_hex") or x.get("payload_preview_hex") or "НЕТ В TRACE"))}</pre><p>WINDOWS USBPcap HEX</p><pre>{html.escape(str(x.get("host_payload_hex") or "НЕТ PAYLOAD В ЗАХВАТЕ"))}</pre><p>PROFILE vs TRACE={html.escape(str(x.get("expected_vs_trace_status")))}; frames={html.escape(str(x.get("host_frames")))}</p></details>' for x in case.get("correlated_data_transfers", [])) or '<p class="muted">Нет сопоставленных endpoint/control payload.</p>'}
+<h3>Ожидаемые дескрипторы, не замеченные в PCAP</h3>{unseen_html or '<p>Все ожидаемые ключи дескрипторов были замечены в захвате.</p>'}
+</details>
 </details>''')
     counts = ''.join(f'<div class="summarybox"><b>{n}</b><span>{html.escape(human_verdict(s))}</span></div>' for s, n in sorted(report["status_counts"].items()))
     recon = report.get("device_reconciliation", {})
@@ -2641,12 +2710,12 @@ def build_html(report: dict[str, Any]) -> str:
     return f'''<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>USB campaign byte report</title>
 <style>
 :root{{color-scheme:light dark;--border:#7d8790;--bg:#12171c;--panel:#1c242c;--text:#e8edf2;--muted:#aeb8c2;--ok:#214d38;--bad:#6c252a;--warn:#5d4a1f;--byte:#313b45}}
-body{{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;background:var(--bg);color:var(--text);margin:0;padding:22px;line-height:1.42}}h1,h2,h3,h4,h5{{font-family:system-ui,sans-serif}}h1{{margin:0 0 6px}}h2{{margin-top:26px}}.meta,.muted{{color:var(--muted);overflow-wrap:anywhere}}.summary{{display:flex;flex-wrap:wrap;gap:8px;margin:18px 0}}.summarybox{{border:1px solid var(--border);border-radius:8px;padding:10px;min-width:130px;display:flex;flex-direction:column;gap:5px}}.summarybox b{{font-size:22px}}.global-details{{border:1px solid var(--border);border-radius:9px;padding:10px;margin:14px 0;background:var(--panel)}}.global-details>summary{{cursor:pointer;font-weight:700}}.case{{border:1px solid var(--border);border-radius:10px;margin:14px 0;padding:12px;background:var(--panel)}}.case-summary{{display:flex;justify-content:center;text-align:center;position:relative;min-height:42px}}.case-summary .case-title{{font-size:22px;flex-basis:100%;text-align:center}}.case-summary .pill,.case-summary .muted{{position:relative}}.exchange-title{{text-align:center;margin:10px 0 18px}}.exchange{{border:1px solid var(--border);border-radius:8px;padding:10px;margin:12px 0;background:var(--bg)}}.exchange-head{{display:flex;gap:12px;align-items:center;flex-wrap:wrap}}.exchange-head b{{font-family:system-ui,sans-serif}}.exchange-head span:nth-child(2){{color:var(--muted);font-size:12px}}.exchange-meta{{font-size:12px;color:var(--muted);overflow-wrap:anywhere}}.exchange-grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin-top:8px}}.exchange-pane{{min-width:0;border:1px solid var(--border);border-radius:7px;padding:10px}}.exchange-pane h4{{margin:0 0 8px;font-size:14px}}.sent-pane{{border-top:4px solid #5288bd}}.received-pane{{border-top:4px solid #3f9a64}}.case-exchange{{margin:12px 0 18px}}summary{{cursor:pointer;display:flex;gap:12px;align-items:center;flex-wrap:wrap;padding:4px}}.case-title{{font-size:18px;font-weight:bold}}.pill{{padding:3px 8px;border-radius:5px;font-size:12px;overflow-wrap:anywhere}}.pill.match,.pill.good{{background:var(--ok)}}.pill.mismatch,.pill.bad{{background:var(--bad)}}.pill.warn{{background:var(--warn)}}.comparegrid{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin:10px 0}}.pane{{min-width:0;border:1px solid var(--border);border-radius:8px;padding:10px}}.pane h4{{margin:0 0 10px}}.expected{{border-top:4px solid #3f9a64}}.observed{{border-top:4px solid #c18d41}}.sent{{border-top:4px solid #5288bd}}.hexdump{{overflow-x:auto;background:#0e1216;padding:8px;border-radius:5px}}.hexrow{{display:flex;gap:8px;white-space:nowrap}}.offset{{color:#8da0b3;min-width:42px}}.ascii{{color:#93a5b7;margin-left:8px}}.byte{{display:inline-block;padding:1px 2px;border-radius:2px;margin-right:1px;background:var(--byte)}}.byte.bad{{background:#a72f39;color:#fff;font-weight:bold}}.byte.good{{background:#254633}}.missing{{color:#ffbd8f;border:1px solid #9a653d;padding:10px;border-radius:5px}}.descriptor-row{{border:1px solid var(--border);border-left:5px solid #777;border-radius:7px;padding:10px;margin:9px 0}}.descriptor-row.added{{border-left-color:#27ae60;background:#123322}}.descriptor-row.unobserved{{border-left-color:#77818a;background:#242a30}}.descriptor-row.changed{{border-left-color:#d69e36;background:#332b18}}.descriptor-row.same{{border-left-color:#568c6b}}.descriptor-pair,.id-grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}}.descriptor-pair pre{{overflow-wrap:anywhere}}.decoded{{margin-top:7px;padding-left:20px;overflow-wrap:anywhere}}.diffline{{margin:10px 0;padding:8px;background:#0e1216;border-radius:5px}}pre{{white-space:pre-wrap;overflow-wrap:anywhere;background:#0e1216;padding:10px;border-radius:5px}}.note{{border-left:4px solid #c18d41;padding:10px;margin:12px 0}}@media(max-width:850px){{.comparegrid{{grid-template-columns:1fr}}.exchange-grid{{grid-template-columns:1fr}}}}
+body{{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;background:var(--bg);color:var(--text);margin:0;padding:22px;line-height:1.42}}h1,h2,h3,h4,h5{{font-family:system-ui,sans-serif}}h1{{margin:0 0 6px}}h2{{margin-top:26px}}.meta,.muted{{color:var(--muted);overflow-wrap:anywhere}}.summary{{display:flex;flex-wrap:wrap;gap:8px;margin:18px 0}}.summarybox{{border:1px solid var(--border);border-radius:8px;padding:10px;min-width:130px;display:flex;flex-direction:column;gap:5px}}.summarybox b{{font-size:22px}}.technical{{margin:10px 0;border:1px solid var(--border);border-radius:7px;padding:8px;background:var(--panel)}}.technical>summary{{font-weight:600}}.global-details{{border:1px solid var(--border);border-radius:9px;padding:10px;margin:14px 0;background:var(--panel)}}.global-details>summary{{cursor:pointer;font-weight:700}}.case{{border:1px solid var(--border);border-radius:10px;margin:14px 0;padding:12px;background:var(--panel)}}.case-summary{{display:flex;justify-content:center;text-align:center;position:relative;min-height:42px}}.case-summary .case-title{{font-size:22px;flex-basis:100%;text-align:center}}.case-summary .pill,.case-summary .muted{{position:relative}}.exchange-title{{text-align:center;margin:10px 0 18px}}.exchange{{border:1px solid var(--border);border-radius:8px;padding:10px;margin:12px 0;background:var(--bg)}}.exchange-head{{display:flex;gap:12px;align-items:center;flex-wrap:wrap}}.exchange-head b{{font-family:system-ui,sans-serif}}.exchange-head span:nth-child(2){{color:var(--muted);font-size:12px}}.exchange-meta{{font-size:12px;color:var(--muted);overflow-wrap:anywhere}}.exchange-grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin-top:8px}}.exchange-pane{{min-width:0;border:1px solid var(--border);border-radius:7px;padding:10px}}.exchange-pane h4{{margin:0 0 8px;font-size:14px}}.sent-pane{{border-top:4px solid #5288bd}}.received-pane{{border-top:4px solid #3f9a64}}.case-exchange{{margin:12px 0 18px}}summary{{cursor:pointer;display:flex;gap:12px;align-items:center;flex-wrap:wrap;padding:4px}}.case-title{{font-size:18px;font-weight:bold}}.pill{{padding:3px 8px;border-radius:5px;font-size:12px;overflow-wrap:anywhere}}.pill.match,.pill.good{{background:var(--ok)}}.pill.mismatch,.pill.bad{{background:var(--bad)}}.pill.warn{{background:var(--warn)}}.comparegrid{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin:10px 0}}.pane{{min-width:0;border:1px solid var(--border);border-radius:8px;padding:10px}}.pane h4{{margin:0 0 10px}}.expected{{border-top:4px solid #3f9a64}}.observed{{border-top:4px solid #c18d41}}.sent{{border-top:4px solid #5288bd}}.hexdump{{overflow-x:auto;background:#0e1216;padding:8px;border-radius:5px}}.hexrow{{display:flex;gap:8px;white-space:nowrap}}.offset{{color:#8da0b3;min-width:42px}}.ascii{{color:#93a5b7;margin-left:8px}}.byte{{display:inline-block;padding:1px 2px;border-radius:2px;margin-right:1px;background:var(--byte)}}.byte.bad{{background:#a72f39;color:#fff;font-weight:bold}}.byte.good{{background:#254633}}.missing{{color:#ffbd8f;border:1px solid #9a653d;padding:10px;border-radius:5px}}.descriptor-row{{border:1px solid var(--border);border-left:5px solid #777;border-radius:7px;padding:10px;margin:9px 0}}.descriptor-row.added{{border-left-color:#27ae60;background:#123322}}.descriptor-row.unobserved{{border-left-color:#77818a;background:#242a30}}.descriptor-row.changed{{border-left-color:#d69e36;background:#332b18}}.descriptor-row.same{{border-left-color:#568c6b}}.descriptor-pair,.id-grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}}.descriptor-pair pre{{overflow-wrap:anywhere}}.decoded{{margin-top:7px;padding-left:20px;overflow-wrap:anywhere}}.diffline{{margin:10px 0;padding:8px;background:#0e1216;border-radius:5px}}pre{{white-space:pre-wrap;overflow-wrap:anywhere;background:#0e1216;padding:10px;border-radius:5px}}.note{{border-left:4px solid #c18d41;padding:10px;margin:12px 0}}@media(max-width:850px){{.comparegrid{{grid-template-columns:1fr}}.exchange-grid{{grid-template-columns:1fr}}}}
 </style></head><body>
 <h1>USB Research Toolkit — побайтовый отчёт кампании</h1><p class="meta">Кампания: {html.escape(report['campaign_dir'])}<br>PCAPNG: {html.escape(report['host_pcap'])}<br>Generated: {html.escape(report['created_utc'])}</p>
-<div class="note">Три источника: ожидаемые байты JSON-профиля; payload Raw Gadget; USBPcap host-stack. Для native USBPcap linktype 249 используется прямой разбор PCAPNG, первые шесть packet records исключаются. Cases сопоставляются с USB enumeration-сессиями по порядку и фактическим дескрипторам/endpoint payload, без сравнения часов Raspberry Pi и Windows. Это не электрический USB-анализатор.</div>
+<div class="note">Три источника: ожидаемые байты JSON-профиля; payload Raw Gadget; USBPcap host-stack. Для native USBPcap linktype 249 используется прямой разбор PCAPNG, анализ начинается с первой packet record. Cases сопоставляются с USB enumeration-сессиями по порядку и фактическим дескрипторам/endpoint payload, без сравнения часов Raspberry Pi и Windows. Это не электрический USB-анализатор.</div>
 <div class="summary">{counts}</div>
-<h2>Сопоставление запусков эмулятора с USB-сессиями Windows</h2>{reconciliation_html}<details class="global-details"><summary><b>Общий инвентарь USBPcap и восстановленные USB-сессии</b> — развернуть</summary><p class="note">Первые шесть packet records исключены до декодирования. Остальной захват анализируется целиком, независимо от временных окон Raspberry Pi.</p>{host_inventory_html(report.get('host_capture_inventory', {}))}</details><h2>Случаи фаззинга и сопоставление</h2>{''.join(cards)}
+<h2>Сопоставление запусков эмулятора с USB-сессиями Windows</h2>{reconciliation_html}<details class="global-details"><summary><b>Общий инвентарь USBPcap и восстановленные USB-сессии</b> — развернуть</summary><p class="note">Анализ начинается с первой packet record. Остальной захват анализируется целиком, независимо от временных окон Raspberry Pi.</p>{host_inventory_html(report.get('host_capture_inventory', {}))}</details><h2>Случаи фаззинга и сопоставление</h2>{''.join(cards)}
 </body></html>'''
 
 
@@ -2656,8 +2725,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--host-pcap", required=True, help="один PCAP/PCAPNG со всей кампанией")
     ap.add_argument("--out-prefix", help="префикс выходных файлов (по умолчанию <campaign-dir>/protocol-report)")
     ap.add_argument("--tshark", default="tshark", help="путь к tshark (только для не-USBPcap fallback)")
-    ap.add_argument("--skip-host-packets", type=int, default=6,
-                    help="сколько начальных packet records PCAPNG игнорировать (default: 6 для USBPcap)")
+    ap.add_argument("--skip-host-packets", type=int, default=0,
+                    help="сколько начальных packet records PCAPNG игнорировать (default: 0; анализ с первой записи)")
     ap.add_argument("--host-correlation-mode", choices=("auto", "sequential", "time"), default="auto",
                     help="auto: sequential для USBPcap linktype 249, time для остальных; sequential не использует clocks")
     ap.add_argument("--time-tolerance", type=float, default=0.75, help="допуск временного сопоставления, seconds")
@@ -2784,7 +2853,7 @@ def main(argv: list[str] | None = None) -> int:
                            ", ".join(f"{frame}:{sorted(owners)}" for frame, owners in list(duplicate_frames.items())[:20]))
 
     status_counts = dict(Counter(case["verdict"] for case in cases))
-    report = {"report_version": 4, "created_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+    report = {"report_version": 5, "created_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
               "campaign_dir": str(campaign_dir), "host_pcap": str(pcap),
               "host_capture_parser": capture_meta, "tshark_fields": fields,
               "host_correlation_mode": correlation_mode, "host_clock_synchronized": False if correlation_mode == "sequential" else None,
@@ -2795,7 +2864,7 @@ def main(argv: list[str] | None = None) -> int:
               "device_reconciliation": device_reconciliation, "cases": cases,
               "limitations": [
                   "USBPcap records Windows USB host-stack/URB observations; it is not an electrical USB analyzer.",
-                  "The first six captured packet records were excluded before USBPcap parsing, as configured.",
+                  "USBPcap parsing starts at the first captured packet record; no initial records are skipped by default.",
                   "Sequential matching uses campaign order and descriptor/endpoint fingerprints; Windows/Pi timestamps are not compared.",
                   "A host session not observed in this capture is not proof of a filter BLOCK without a filter ALLOW/BLOCK event log.",
                   "A successful SET_CONFIGURATION completion proves the host stack completed that request, not that the class driver loaded or the device functioned correctly.",

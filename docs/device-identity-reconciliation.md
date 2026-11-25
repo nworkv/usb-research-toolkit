@@ -6,7 +6,7 @@
 
 ## Разбор Windows USBPcap
 
-Для USBPcap PCAPNG с linktype `249` `report-usb-campaign.py` читает PCAPNG напрямую. Первые шесть packet records по умолчанию исключаются **до декодирования и построения сессий** (`--skip-host-packets 6`). USBPcap `SETUP` и `COMPLETE` пары связываются по `IRP ID`; `Control transfer stage` отличает Setup/Data/Status/Complete. Это не зависит от заполнения `usb.urb_type` или названий полей TShark.
+Для USBPcap PCAPNG с linktype `249` `report-usb-campaign.py` читает PCAPNG напрямую. По умолчанию анализ начинается с первой packet record; пропуск пакетов не применяется. USBPcap `SETUP` и `COMPLETE` пары связываются по `IRP ID`; `Control transfer stage` отличает Setup/Data/Status/Complete. Это не зависит от заполнения `usb.urb_type` или названий полей TShark.
 
 Новая enumeration-сессия фиксируется при следующем `GET_DESCRIPTOR(Device)` после завершённого успешного `SET_CONFIGURATION` предыдущей сессии. USB bus/address используется для сопровождения сессии, но не как постоянная идентичность устройства: адрес может повторно использоваться. В текущем режиме кампании эмулируется строго одно устройство за раз.
 

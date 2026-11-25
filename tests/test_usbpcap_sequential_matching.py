@@ -70,6 +70,24 @@ def test_first_six_raw_packet_records_are_skipped():
     assert groups[0]["payload"] == device
 
 
+
+def test_default_starts_at_first_packet_record():
+    unrelated = [_usbpcap_packet(i, 0x0009, 0, 1, 2, 0x01, 3, None, 0, b"xx") for i in range(1, 7)]
+    device = bytes.fromhex("12 01 00 02 00 00 00 40 09 12 00 12 00 01 01 02 03 01")
+    setup = struct.pack("<BBHHH", 0x80, 6, 0x0100, 0, 18)
+    records = unrelated + [
+        _usbpcap_packet(0xABC, 0x000B, 0, 1, 1, 0, 2, 0, 0, setup),
+        _usbpcap_packet(0xABC, 0x0008, 1, 1, 1, 0, 2, 3, 0, device),
+    ]
+    with tempfile.TemporaryDirectory() as td:
+        capture = Path(td) / "fixture.pcapng"
+        capture.write_bytes(_pcapng(records))
+        rows, meta = REPORTER.read_usbpcap_pcapng_rows(capture)
+    assert meta["packet_count"] == 8
+    assert meta["skipped_packets"] == 0
+    assert meta["first_included_frame"] == 1
+    assert [r["frame_number"] for r in rows] == list(range(1, 9))
+
 def test_teardown_does_not_become_host_transfer_failure():
     rows = [
         {"frame_number": 10, "bus_id": 1, "device_address": 1, "irp_id": "a",

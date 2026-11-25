@@ -20,7 +20,7 @@ Raw Gadget — низкоуровневый debug-интерфейс ядра Li
 
 ## Новое в 0.5.11: восстановление и сопоставление USBPcap без синхронизации часов
 
-Для Windows USBPcap с linktype `249` отчёт читает PCAPNG напрямую, а не полагается на названия полей TShark. По умолчанию **первые шесть packet records пропускаются до разбора**. SETUP и COMPLETE связываются по `IRP ID` и стадии control transfer; повторные enumeration-сессии разделяются по завершённому `SET_CONFIGURATION` и следующему `GET_DESCRIPTOR(Device)`.
+Для Windows USBPcap с linktype `249` отчёт читает PCAPNG напрямую, а не полагается на названия полей TShark. По умолчанию анализ начинается с **первой packet record**; пропуск записей отключён. SETUP и COMPLETE связываются по `IRP ID` и стадии control transfer; повторные enumeration-сессии разделяются по завершённому `SET_CONFIGURATION` и следующему `GET_DESCRIPTOR(Device)`.
 
 В режиме `auto` USBPcap linktype `249` всегда использует `sequential`: случаи сопоставляются с сессиями по порядку кампании и отпечаткам Device/Configuration/HID Report descriptors и endpoint payload. Временные метки Windows и Raspberry Pi для этого не используются. Серийный номер служит дополнительным ключом только если Windows действительно запросила строковый дескриптор; наличие `iSerialNumber` в Device Descriptor само по себе не означает, что значение серийного номера прочитано.
 
@@ -317,21 +317,42 @@ sudo build/usb-connect run profiles/templates/multi-config-keyboard-mouse.json \
 
 Составные профили содержат несколько endpoints и потому зависят от их числа/направления, packet-size и поддержки типов endpoint конкретным UDC. Если `ENDPOINT_ENABLE_ERROR` фиксируется, посмотрите `ENDPOINT_CAPABILITIES` в trace. Runtime alternate-setting switching и isochronous I/O пока не реализованы.
 
-## 9. Генерация профилей для проверки до реального старта
+## 9–10. Подготовка и запуск кампании без дублирования параметров
 
-Сперва создайте план `dry-run` — он не подключает USB:
+Задай параметры кампании один раз. Один и тот же набор аргументов используется для dry-run и реального запуска; меняется только флаг `--dry-run` и каталог результатов.
 
 ```bash
 STAMP=$(date +%Y%m%d-%H%M%S)
+BASE="profiles/templates/hid-mouse.json"
+COUNT=5
+SEED=20261028
+MUTATIONS=1
+OUT="runs/fuzz/hid-smoke-$STAMP"
 PLAN="runs/fuzz/dry-run-$STAMP"
-python3 scripts/usb-gadget-campaign.py \
-  --base profiles/templates/hid-mouse.json \
-  --count 5 --seed 20261028 --mutations 1 \
-  --udc-driver "$UDC_DRIVER" --udc-device "$UDC_DEVICE" \
-  --out-dir "$PLAN" --dry-run
+CAPTURE_DIR="/srv/usb-captures/hid-smoke-$STAMP"
+
+COMMON_ARGS=(
+  --base "$BASE"
+  --count "$COUNT"
+  --seed "$SEED"
+  --mutations "$MUTATIONS"
+  --udc-driver "$UDC_DRIVER"
+  --udc-device "$UDC_DEVICE"
+)
+
+sudo install -d -m 2770 -o "$USER" -g "$(id -gn)" "$CAPTURE_DIR"
 ```
 
-Посмотреть манифест и профили:
+Сначала проверь план без подключения USB:
+
+```bash
+python3 scripts/usb-gadget-campaign.py \
+  "${COMMON_ARGS[@]}" \
+  --out-dir "$PLAN" \
+  --dry-run
+```
+
+Посмотри манифест и сгенерированные профили:
 
 ```bash
 cat "$PLAN/summary.json"
@@ -339,43 +360,31 @@ less "$PLAN/manifest.json"
 ls "$PLAN"/case-*.json
 ```
 
-`--mutations N` — максимум N отдельных изменений поля на профиль. Уникальность профилей следует проверять отдельно: 1000 записей не гарантируют 1000 уникальных USB-конфигураций.
-
-## 10. Малый запуск фаззинга с Live Console
-
-Сначала убедитесь, что базовый profile стартует и Wireshark действительно фиксирует USB-запросы. Затем проведите кампанию из пяти случаев. Новые имена каталогов предотвращают затирание предыдущих результатов:
-
-```bash
-STAMP=$(date +%Y%m%d-%H%M%S)
-OUT="runs/fuzz/hid-smoke-$STAMP"
-CAPTURE_DIR="/srv/usb-captures/hid-smoke-$STAMP"
-sudo install -d -m 2770 -o "$USER" -g "$(id -gn)" "$CAPTURE_DIR"
-echo "Результаты: $OUT"
-echo "Захваты: $CAPTURE_DIR"
-```
-
-На Windows начните USBPcap захват. Затем на Pi:
+Затем на Windows начни USBPcap захват. После этого на Raspberry Pi выполни реальную кампанию — параметры профиля и мутаций повторно вводить не нужно:
 
 ```bash
 sudo python3 scripts/usb-gadget-campaign.py \
-  --base profiles/templates/hid-mouse.json \
-  --count 5 --seed 20261028 --mutations 1 \
-  --udc-driver "$UDC_DRIVER" --udc-device "$UDC_DEVICE" \
-  --dwell-seconds 10 --settle-seconds 3 \
+  "${COMMON_ARGS[@]}" \
+  --dwell-seconds 10 \
+  --settle-seconds 3 \
   --live-progress-interval 1 \
-  --capture-dir "$CAPTURE_DIR" --out-dir "$OUT" \
-  --allow-research --confirm-lab
+  --capture-dir "$CAPTURE_DIR" \
+  --out-dir "$OUT" \
+  --allow-research \
+  --confirm-lab
 ```
 
-Во время запуска Live Console показывает имя профиля, SHA-256, изменённые параметры, события GET_DESCRIPTOR/EP0, SET_CONFIGURATION, STALL/RESET и статус процесса по мере появления trace-событий.
+`--mutations N` — максимум N изменений на профиль, а не гарантия ровно N мутаций. Уникальность профилей следует проверять отдельно: 1000 записей не гарантируют 1000 уникальных USB-конфигураций.
 
-- `START_FAILED` означает, что сам процесс не запустился; это не свидетельство реакции Windows.
-- `RUNNING` означает, что процесс Gadget жив.
-- `CONTROL_REQUEST` означает, что Raw Gadget получил управляющий запрос хоста.
-- `SET_CONFIGURATION` означает, что в журнале зафиксирован ненулевой выбранный конфиг.
-- `COMPLETED` означает только, что процесс проработал заданное время и был корректно завершён; это не обещает, что Windows успешно приняла устройство.
+Live Console показывает профиль, SHA-256, изменённые параметры, события GET_DESCRIPTOR/EP0, SET_CONFIGURATION, STALL/RESET и состояние процесса.
 
-Не переходите к сотням вариантов, если почти все случаи — `START_FAILED` или trace не показывает запросов хоста. Сначала исправьте UDC/descriptor/runtime.
+- `START_FAILED` — процесс Gadget не запустился; это не свидетельство реакции Windows.
+- `RUNNING` — процесс Gadget работает.
+- `CONTROL_REQUEST` — Raw Gadget получил управляющий запрос хоста.
+- `SET_CONFIGURATION` — событие конфигурации записано в trace.
+- `COMPLETED` — процесс проработал заданное время и завершился; это не подтверждает функциональность устройства.
+
+Не переходи к сотням вариантов, пока пробная кампания не показывает корректный запуск Gadget и реальные USB-запросы в USBPcap.
 
 ## 11. Результаты и изменения каждого профиля
 
@@ -596,7 +605,7 @@ VID/PID в шаблонах — учебные значения. Использ�
 
 1. **Ожидалось** — дескриптор/статический payload, скомпилированный из точного `case-NNNNN.json`.
 2. **Записал Raw Gadget** — payload, который backend передал в `EP0_WRITE`/`EP_WRITE` либо прочитал через `EP0_READ`/`EP_READ` и записал в device trace. Это программная фиксация ioctl, не измерение электрической шины.
-3. **Наблюдал Windows USBPcap** — данные ответа/передачи, извлечённые TShark из одного общего PCAPNG.
+3. **Наблюдал Windows USBPcap** — фактические данные ответа/передачи из одного общего PCAPNG.
 
 Генерируются `protocol-report.html`, `protocol-report.txt` и `protocol-report.json`. Помимо трёхстороннего сравнения отдельных транзакций отчёт строит инвентарь полной ожидаемой конфигурации и максимально полной конфигурации, фактически наблюдавшейся в USBPcap.
 
@@ -604,17 +613,16 @@ VID/PID в шаблонах — учебные значения. Использ�
 python3 scripts/report-usb-campaign.py \
   --campaign-dir runs/fuzz/hid-campaign-YYYYMMDD-HHMMSS \
   --host-pcap /srv/usb-captures/hid-campaign-YYYYMMDD-HHMMSS/campaign.pcapng \
-  --skip-host-packets 6 \
   --host-correlation-mode sequential
 ```
 
 Фактические имена каталогов и PCAPNG нужно заменить своими. По умолчанию отчёты сохраняются в каталоге кампании:
 
-- `protocol-report.html` — для каждого Case сразу показывает номер по центру и журнал обмена в двух колонках: слева Host → Device (отправлено), справа Device → Host (получено). Control Transfers содержат Setup Packet в HEX и расшифровку полей; GET_DESCRIPTOR дополнительно декодирует ответ. Bulk, Interrupt и Isochronous Transfers выводятся отдельными блоками с HEX, Endpoint, направлением, кадрами, IRP ID и статусом. Ниже остаются подробное сравнение Expected / Raw Gadget / USBPcap и инвентарь конфигурации;
+- `protocol-report.html` — номер Case по центру; слева фактические байты Host → Device, справа фактические байты Device → Host. Control Transfers показывают Setup Packet и data stage в HEX; расшифровка доступна для Setup и дескрипторов. Bulk, Interrupt и Isochronous выводятся отдельными блоками. Повторяющиеся события Raw Gadget, включая `DEVICE_IN_TRANSFER_COMPLETE`, сворачиваются в счётчик;
 - `protocol-report.txt` — тот же журнал транзакций с отдельными строками ОТПРАВЛЕНО / ПОЛУЧЕНО, HEX и расшифровкой управляющих запросов, плюс побайтовые сравнения;
 - `protocol-report.json` — статусы, кадры, исходные HEX, объект `usb_exchange_log` для каждого Case и `configuration_comparison` с `expected_ids`, `host_ids`, списком `entries` и декодированными полями.
 
-Отсутствующие байты не заменяются нулями. Неполный захват, отсутствие completion URB и Control payload без однозначно сопоставленного Setup Packet помечаются отдельно; направление таких данных не угадывается. В JSON используется `report_version: 4`.
+Байты в колонках берутся только из USBPcap. Setup Packet показывается слева как отправленный Host запрос; фактический data stage ответа — справа для IN и слева для OUT. Нулевой payload не изображается фиктивными байтами. Если USBPcap dataLength больше фактически захваченного payload, отчёт показывает расхождение длины и кадр. Control payload без однозначно сопоставленного Setup Packet не приписывается ни одной стороне. В JSON используется `report_version: 5`.
 
 Откройте HTML в браузере:
 
@@ -629,11 +637,11 @@ less runs/fuzz/hid-campaign-YYYYMMDD-HHMMSS/protocol-report.txt
 ```
 
 
-В разделе **«Полная конфигурация: EXPECTED ↔ максимально восстановленная USBPcap»** отчёт использует все ответы `GET_DESCRIPTOR`, обнаруженные в окне случая. Для повторных запросов одного дескриптора сохраняются наблюдения, а для отображения выбирается наиболее полный успешный payload. Дескрипторы, которые хост не запрашивал в данном захвате, маркируются `NOT_REQUESTED` и не считаются доказанно удалёнными из устройства. Если запрос был, но payload не извлечён, состояние будет `REQUESTED_NO_PAYLOAD`. Поле `host_configuration_descriptors` содержит захваченные Configuration Descriptor и проверку длины относительно `wTotalLength`.
+В разделе **«Полная конфигурация: EXPECTED ↔ максимально восстановленная USBPcap»** отчёт использует все ответы `GET_DESCRIPTOR`, обнаруженные в окне случая. Для повторных запросов одного дескриптора сохраняются наблюдения, а для отображения выбирается наиболее полный успешный payload. Дескрипторы, которые хост не запрашивал в данном захвате, маркируются `NOT_REQUESTED` и не считаются доказанно удалёнными из устройства. Если запрос был, но USBPcap не содержит data payload, состояние будет `REQUESTED_NO_PAYLOAD`. Поле `host_configuration_descriptors` содержит захваченные Configuration Descriptor и проверку длины относительно `wTotalLength`.
 
 Важно: «максимально восстановленная» означает максимум данных, которые реально удалось извлечь из данного USBPcap, а не гарантированно исчерпывающий перечень всех дескрипторов устройства. USBPcap не может показать дескриптор, который Windows не запросила или который не попал в захват.
 
-Скрипт берёт ожидаемые байты из **точного `case-NNNNN.json` данного запуска**, а не из исходного шаблона. При USBPcap linktype `249` он восстанавливает USB-сессии из frame order, а затем связывает их с профилями case по байтовому отпечатку. Часы Windows и Raspberry Pi синхронизировать не требуется. Если профиль не даёт уникального отпечатка, отчёт оставляет сопоставление неоднозначным, а не назначает сессию наугад. Первые шесть packet records PCAPNG исключаются до декодирования; изменить число можно через `--skip-host-packets`.
+Скрипт берёт ожидаемые байты из **точного `case-NNNNN.json` данного запуска**, а не из исходного шаблона. При USBPcap linktype `249` он восстанавливает USB-сессии из frame order, а затем связывает их с профилями case по байтовому отпечатку. Часы Windows и Raspberry Pi синхронизировать не требуется. Если профиль не даёт уникального отпечатка, отчёт оставляет сопоставление неоднозначным, а не назначает сессию наугад. По умолчанию анализируются все packet records, начиная с первой. `--skip-host-packets` оставлен только как необязательный параметр ручного исключения записей; в обычном запуске его не указывайте.
 
 В TShark fallback для иных linktype временной режим остаётся доступен явно через `--host-correlation-mode time`, но он требует синхронизированных или откалиброванных часов. Для захвата с USBPcap linktype `249` режим `auto` выбирает `sequential`.
 
@@ -643,7 +651,7 @@ less runs/fuzz/hid-campaign-YYYYMMDD-HHMMSS/protocol-report.txt
 - `EXPECTED_DESCRIPTOR_BYTES_MATCH_CONFIGURATION_PARTIAL` — байты совпали, но факт конфигурирования подтвердил только один источник.
 - `EXPECTED_DESCRIPTOR_BYTES_MATCH_ENUMERATION_INCOMPLETE` — сравнимые байты совпали, но CONFIGURED не подтверждён.
 - `HOST_DESCRIPTOR_BYTES_MISMATCH` — в ответе USBPcap есть байты или длина, отличающиеся от ожидаемого дескриптора. Отчёт показывает первое смещение и всю побайтовую таблицу.
-- `HOST_RESPONSE_BYTES_UNAVAILABLE` — запрос замечен, но ответные байты не удалось извлечь.
+- `HOST_RESPONSE_BYTES_UNAVAILABLE` — запрос замечен, но в USBPcap capture отсутствует payload ответа.
 - `HOST_TRANSFER_ERROR_OBSERVED` — завершённая host transfer операция имеет реальный ошибочный статус. `USBD_STATUS_CANCELED` и `URB_FUNCTION_ABORT_PIPE` относятся к остановке/teardown и выводятся отдельно.
 - `HOST_REQUESTED_DESCRIPTOR_NOT_DEFINED_IN_PROFILE` — хост запросил дескриптор, которого нет в ожидаемом каталоге профиля.
 - `NO_HOST_EVIDENCE_FOR_CASE` — для case не сопоставлена USB-сессия в захвате.
@@ -839,9 +847,8 @@ python3 scripts/usb-time-sync.py \\
 
 ## Full USBPcap enumeration inventory (updated report)
 
-`report-usb-campaign.py` excludes the first six raw packet records by default for this
-USBPcap campaign capture, then builds a capture-wide USB enumeration inventory before
-assigning traffic to fuzz cases. USBPcap linktype 249 uses direct PCAPNG parsing and
+`report-usb-campaign.py` analyzes all packet records from the first by default, then
+builds a capture-wide USB enumeration inventory before assigning traffic to fuzz cases. USBPcap linktype 249 uses direct PCAPNG parsing and
 sequential profile-fingerprint matching; Windows/Pi timestamps are not compared.
 
 For Windows USBPcap, request and completion frames are correlated by `IRP ID`, with
@@ -858,13 +865,12 @@ Per-case Expected / Raw Gadget trace / USBPcap comparison remains separate from 
 capture-wide inventory. USBPcap is a Windows host-stack capture, not an electrical
 USB analyzer.
 
-Generate the report (the first six packet records are skipped by default):
+Generate the report (all packet records are analyzed from the first by default):
 
 ```bash
 python3 scripts/report-usb-campaign.py \
   --campaign-dir runs/fuzz/<campaign-directory> \
   --host-pcap /path/to/campaign.pcapng \
-  --skip-host-packets 6 \
   --host-correlation-mode sequential
 ```
 
