@@ -2671,6 +2671,58 @@ def usb_exchange_html(tx: dict[str, Any], index: int) -> str:
     return f'''<article class="exchange"><div class="exchange-head"><b>#{index:04d} · {html.escape(str(tx.get('transfer_type')))}</b><span>{html.escape(str(tx.get('direction')))} · {html.escape(endpoint)} · frames {html.escape(frames)}</span><span class="pill {status_class}">{html.escape(status)}</span></div><p class="exchange-meta">Bus {html.escape(str(tx.get('bus_id')))} · USB address {html.escape(str(tx.get('device_address')))} · IRP {html.escape(str(tx.get('irp_id') or '—'))} · длины: отправлено {tx.get('sent_length') if tx.get('sent_length') is not None else '—'} B / получено {tx.get('received_length') if tx.get('received_length') is not None else '—'} B</p><div class="exchange-grid">{left}{right}</div>{orphan_html}{flags_html}</article>'''
 
 
+
+def exchange_problem_level(tx: dict[str, Any]) -> str:
+    """Classify only observed USBPcap transfer evidence."""
+    status = str(tx.get("status") or "UNKNOWN").upper()
+    if status in {"ERROR", "STALL", "TIMEOUT", "FAILED"}:
+        return "error"
+    if tx.get("payload_truncated") or tx.get("payload_capture_gaps") or not tx.get("complete_seen"):
+        return "warning"
+    return "ok"
+
+
+def usb_exchange_groups_html(transactions: list[dict[str, Any]]) -> tuple[str, dict[str, int]]:
+    """Group similar transfers; keep each original transaction available in details."""
+    grouped: dict[tuple[Any, ...], list[tuple[int, dict[str, Any]]]] = {}
+    counts = {"error": 0, "warning": 0, "ok": 0}
+    for index, tx in enumerate(transactions, 1):
+        level = exchange_problem_level(tx)
+        counts[level] += 1
+        setup = tx.get("setup_hex") if tx.get("transfer_type") == 2 else None
+        key = (tx.get("transfer_type"), tx.get("direction"), tx.get("endpoint_address"),
+               tx.get("status"), setup)
+        grouped.setdefault(key, []).append((index, tx))
+
+    sections = []
+    for key, items in grouped.items():
+        first = items[0][1]
+        levels = {exchange_problem_level(tx) for _, tx in items}
+        level = "error" if "error" in levels else "warning" if "warning" in levels else "ok"
+        transfer_type = str(first.get("transfer_type"))
+        direction = str(first.get("direction") or "UNKNOWN")
+        endpoint = f"EP 0x{int(first['endpoint_address']):02X}" if first.get("endpoint_address") is not None else "EP0"
+        status = str(first.get("status") or "UNKNOWN")
+        frames = [n for _, tx in items for n in tx.get("frames", []) if n is not None]
+        frame_label = f"кадры {min(frames)}–{max(frames)}" if frames else "кадры не указаны"
+        label = f"{transfer_type} · {direction} · {endpoint} · {status}"
+        if key[4]:
+            label += f" · SETUP {str(key[4]).upper()}"
+        body = "".join(usb_exchange_html(tx, index) for index, tx in items)
+        badge_text = "ОШИБКА" if level == "error" else "ПРОВЕРИТЬ" if level == "warning" else "штатно"
+        badge_class = "bad" if level == "error" else "warn" if level == "warning" else "good"
+        # Error groups open automatically; routine traffic stays collapsed.
+        open_attr = " open" if level == "error" else ""
+        sections.append(
+            f'<details class="exchange-group {level}"{open_attr}>'
+            f'<summary><b>{html.escape(label)}</b>'
+            f'<span class="group-count">× {len(items)} · {html.escape(frame_label)}</span>'
+            f'<span class="pill {badge_class}">{badge_text}</span></summary>'
+            f'<div class="exchange-group-body">{body}</div></details>'
+        )
+    return "".join(sections), counts
+
+
 def build_html(report: dict[str, Any]) -> str:
     cards = []
     for case in report["cases"]:
@@ -2688,9 +2740,16 @@ def build_html(report: dict[str, Any]) -> str:
         repeated_event_count = int(events.get("device_in_transfer_complete_count", 0) or 0)
         repeated_event_suffix = f"; DEVICE_IN_TRANSFER_COMPLETE × {repeated_event_count}" if repeated_event_count else ""
         setcfg = ''.join(f'<li>value={x["value"]}; frames={html.escape(str(x["frames"]))}; transfer={html.escape(str(x["status"]))}; complete={x["complete_seen"]}; error={x["error"]}</li>' for x in case["host_set_configuration"]) or '<li>SET_CONFIGURATION не наблюдался в PCAP.</li>'
-        exchange_log_html = ''.join(usb_exchange_html(tx, i) for i, tx in enumerate(case.get("usb_exchange_log", []), 1)) or '<p class="muted">Нет USBPcap-транзакций, однозначно назначенных этому Case.</p>'
-        cards.append(f'''<details class="case {case_class}" open>
-<summary class="case-summary"><span class="case-title">CASE {case['case']:05d}</span><span class="pill {case_class}">{html.escape(human_verdict(case['verdict']))}</span><span class="muted">run={html.escape(case['run_status'])}; session={html.escape(str(case.get('host_session_id') or case.get('host_session_match', {}).get('status') or 'NOT_ASSIGNED'))}; host groups={case['host_groups_in_window']}</span></summary>
+        exchange_log_html, exchange_counts = usb_exchange_groups_html(case.get("usb_exchange_log", []))
+        if not exchange_log_html:
+            exchange_log_html = '<p class="muted">Нет USBPcap-транзакций, однозначно назначенных этому Case.</p>'
+        exchange_issue_summary = (
+            f' · USB: ошибок {exchange_counts["error"]}, проверить {exchange_counts["warning"]}'
+            if exchange_counts["error"] or exchange_counts["warning"]
+            else f' · USB: {exchange_counts["ok"]} штатных передач'
+        )
+        cards.append(f'''<details class="case {case_class}">
+<summary class="case-summary"><span class="case-title">CASE {case['case']:05d}</span><span class="pill {case_class}">{html.escape(human_verdict(case['verdict']))}</span><span class="muted">run={html.escape(case['run_status'])}; session={html.escape(str(case.get('host_session_id') or case.get('host_session_match', {}).get('status') or 'NOT_ASSIGNED'))}; host groups={case['host_groups_in_window']}{html.escape(exchange_issue_summary)}</span></summary>
 <div class="case-exchange"><h3 class="exchange-title">CASE {case['case']:05d} — USB-ОБМЕН</h3>{exchange_log_html}</div>
 <details class="technical"><summary>Диагностика и сравнение</summary>
 <div class="meta"><p><b>Профиль:</b> {html.escape(case['profile'])}</p><p><b>SHA-256:</b> <code>{html.escape(str(case.get('profile_sha256')))}</code></p><p><b>Trace:</b> {html.escape(str(case.get('trace')))}</p><p><b>Pi:</b> CONTROL_REQUEST={events['control_request_count']}; CONTROL_RESPONSE_COMPLETE={events['control_response_complete_count']}; CONFIGURED={events['configured_observed']}; STALL={events['stall_count']}; RESET={events['reset_count']}; DISCONNECT={events['disconnect_count']} ; ERROR={events['error_count']}{repeated_event_suffix}</p><p><b>Windows USBPcap:</b> реальные ошибки={len(case.get('host_errors', []))}; CANCELLED при остановке={len(case.get('host_cancellations', []))}; ABORT_PIPE teardown={len(case.get('host_teardown_events', []))}</p><p><b>Проверка байтов:</b> {html.escape(str(case.get('byte_correlation_status')))}</p>{''.join('<p class="missing">'+html.escape(str(w))+'</p>' for w in case.get('warnings', []))}</div>
@@ -2710,7 +2769,7 @@ def build_html(report: dict[str, Any]) -> str:
     return f'''<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>USB campaign byte report</title>
 <style>
 :root{{color-scheme:light dark;--border:#7d8790;--bg:#12171c;--panel:#1c242c;--text:#e8edf2;--muted:#aeb8c2;--ok:#214d38;--bad:#6c252a;--warn:#5d4a1f;--byte:#313b45}}
-body{{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;background:var(--bg);color:var(--text);margin:0;padding:22px;line-height:1.42}}h1,h2,h3,h4,h5{{font-family:system-ui,sans-serif}}h1{{margin:0 0 6px}}h2{{margin-top:26px}}.meta,.muted{{color:var(--muted);overflow-wrap:anywhere}}.summary{{display:flex;flex-wrap:wrap;gap:8px;margin:18px 0}}.summarybox{{border:1px solid var(--border);border-radius:8px;padding:10px;min-width:130px;display:flex;flex-direction:column;gap:5px}}.summarybox b{{font-size:22px}}.technical{{margin:10px 0;border:1px solid var(--border);border-radius:7px;padding:8px;background:var(--panel)}}.technical>summary{{font-weight:600}}.global-details{{border:1px solid var(--border);border-radius:9px;padding:10px;margin:14px 0;background:var(--panel)}}.global-details>summary{{cursor:pointer;font-weight:700}}.case{{border:1px solid var(--border);border-radius:10px;margin:14px 0;padding:12px;background:var(--panel)}}.case-summary{{display:flex;justify-content:center;text-align:center;position:relative;min-height:42px}}.case-summary .case-title{{font-size:22px;flex-basis:100%;text-align:center}}.case-summary .pill,.case-summary .muted{{position:relative}}.exchange-title{{text-align:center;margin:10px 0 18px}}.exchange{{border:1px solid var(--border);border-radius:8px;padding:10px;margin:12px 0;background:var(--bg)}}.exchange-head{{display:flex;gap:12px;align-items:center;flex-wrap:wrap}}.exchange-head b{{font-family:system-ui,sans-serif}}.exchange-head span:nth-child(2){{color:var(--muted);font-size:12px}}.exchange-meta{{font-size:12px;color:var(--muted);overflow-wrap:anywhere}}.exchange-grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin-top:8px}}.exchange-pane{{min-width:0;border:1px solid var(--border);border-radius:7px;padding:10px}}.exchange-pane h4{{margin:0 0 8px;font-size:14px}}.sent-pane{{border-top:4px solid #5288bd}}.received-pane{{border-top:4px solid #3f9a64}}.case-exchange{{margin:12px 0 18px}}summary{{cursor:pointer;display:flex;gap:12px;align-items:center;flex-wrap:wrap;padding:4px}}.case-title{{font-size:18px;font-weight:bold}}.pill{{padding:3px 8px;border-radius:5px;font-size:12px;overflow-wrap:anywhere}}.pill.match,.pill.good{{background:var(--ok)}}.pill.mismatch,.pill.bad{{background:var(--bad)}}.pill.warn{{background:var(--warn)}}.comparegrid{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin:10px 0}}.pane{{min-width:0;border:1px solid var(--border);border-radius:8px;padding:10px}}.pane h4{{margin:0 0 10px}}.expected{{border-top:4px solid #3f9a64}}.observed{{border-top:4px solid #c18d41}}.sent{{border-top:4px solid #5288bd}}.hexdump{{overflow-x:auto;background:#0e1216;padding:8px;border-radius:5px}}.hexrow{{display:flex;gap:8px;white-space:nowrap}}.offset{{color:#8da0b3;min-width:42px}}.ascii{{color:#93a5b7;margin-left:8px}}.byte{{display:inline-block;padding:1px 2px;border-radius:2px;margin-right:1px;background:var(--byte)}}.byte.bad{{background:#a72f39;color:#fff;font-weight:bold}}.byte.good{{background:#254633}}.missing{{color:#ffbd8f;border:1px solid #9a653d;padding:10px;border-radius:5px}}.descriptor-row{{border:1px solid var(--border);border-left:5px solid #777;border-radius:7px;padding:10px;margin:9px 0}}.descriptor-row.added{{border-left-color:#27ae60;background:#123322}}.descriptor-row.unobserved{{border-left-color:#77818a;background:#242a30}}.descriptor-row.changed{{border-left-color:#d69e36;background:#332b18}}.descriptor-row.same{{border-left-color:#568c6b}}.descriptor-pair,.id-grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}}.descriptor-pair pre{{overflow-wrap:anywhere}}.decoded{{margin-top:7px;padding-left:20px;overflow-wrap:anywhere}}.diffline{{margin:10px 0;padding:8px;background:#0e1216;border-radius:5px}}pre{{white-space:pre-wrap;overflow-wrap:anywhere;background:#0e1216;padding:10px;border-radius:5px}}.note{{border-left:4px solid #c18d41;padding:10px;margin:12px 0}}@media(max-width:850px){{.comparegrid{{grid-template-columns:1fr}}.exchange-grid{{grid-template-columns:1fr}}}}
+body{{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;background:var(--bg);color:var(--text);margin:0;padding:22px;line-height:1.42}}h1,h2,h3,h4,h5{{font-family:system-ui,sans-serif}}h1{{margin:0 0 6px}}h2{{margin-top:26px}}.meta,.muted{{color:var(--muted);overflow-wrap:anywhere}}.summary{{display:flex;flex-wrap:wrap;gap:8px;margin:18px 0}}.summarybox{{border:1px solid var(--border);border-radius:8px;padding:10px;min-width:130px;display:flex;flex-direction:column;gap:5px}}.summarybox b{{font-size:22px}}.technical{{margin:10px 0;border:1px solid var(--border);border-radius:7px;padding:8px;background:var(--panel)}}.technical>summary{{font-weight:600}}.global-details{{border:1px solid var(--border);border-radius:9px;padding:10px;margin:14px 0;background:var(--panel)}}.global-details>summary{{cursor:pointer;font-weight:700}}.case{{border:1px solid var(--border);border-radius:10px;margin:14px 0;padding:12px;background:var(--panel)}}.case-summary{{display:flex;justify-content:center;text-align:center;position:relative;min-height:42px}}.case-summary .case-title{{font-size:22px;flex-basis:100%;text-align:center}}.case-summary .pill,.case-summary .muted{{position:relative}}.exchange-title{{text-align:center;margin:10px 0 18px}}.exchange{{border:1px solid var(--border);border-radius:8px;padding:10px;margin:12px 0;background:var(--bg)}}.exchange-group{{border:1px solid var(--border);border-radius:8px;margin:8px 0;padding:8px;background:var(--bg)}}.exchange-group>summary{{display:flex;gap:10px;align-items:center;flex-wrap:wrap}}.exchange-group.ok>summary{{border-left:4px solid #3f9a64;padding-left:9px}}.exchange-group.warning>summary{{border-left:4px solid #c18d41;padding-left:9px}}.exchange-group.error>summary{{border-left:4px solid #c43e48;padding-left:9px}}.group-count{{color:var(--muted);font-size:12px}}.exchange-group-body{{padding-top:4px}}.exchange-group-body .exchange{{margin:8px 0}}.exchange-head{{display:flex;gap:12px;align-items:center;flex-wrap:wrap}}.exchange-head b{{font-family:system-ui,sans-serif}}.exchange-head span:nth-child(2){{color:var(--muted);font-size:12px}}.exchange-meta{{font-size:12px;color:var(--muted);overflow-wrap:anywhere}}.exchange-grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin-top:8px}}.exchange-pane{{min-width:0;border:1px solid var(--border);border-radius:7px;padding:10px}}.exchange-pane h4{{margin:0 0 8px;font-size:14px}}.sent-pane{{border-top:4px solid #5288bd}}.received-pane{{border-top:4px solid #3f9a64}}.case-exchange{{margin:12px 0 18px}}summary{{cursor:pointer;display:flex;gap:12px;align-items:center;flex-wrap:wrap;padding:4px}}.case-title{{font-size:18px;font-weight:bold}}.pill{{padding:3px 8px;border-radius:5px;font-size:12px;overflow-wrap:anywhere}}.pill.match,.pill.good{{background:var(--ok)}}.pill.mismatch,.pill.bad{{background:var(--bad)}}.pill.warn{{background:var(--warn)}}.comparegrid{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin:10px 0}}.pane{{min-width:0;border:1px solid var(--border);border-radius:8px;padding:10px}}.pane h4{{margin:0 0 10px}}.expected{{border-top:4px solid #3f9a64}}.observed{{border-top:4px solid #c18d41}}.sent{{border-top:4px solid #5288bd}}.hexdump{{overflow-x:auto;background:#0e1216;padding:8px;border-radius:5px}}.hexrow{{display:flex;gap:8px;white-space:nowrap}}.offset{{color:#8da0b3;min-width:42px}}.ascii{{color:#93a5b7;margin-left:8px}}.byte{{display:inline-block;padding:1px 2px;border-radius:2px;margin-right:1px;background:var(--byte)}}.byte.bad{{background:#a72f39;color:#fff;font-weight:bold}}.byte.good{{background:#254633}}.missing{{color:#ffbd8f;border:1px solid #9a653d;padding:10px;border-radius:5px}}.descriptor-row{{border:1px solid var(--border);border-left:5px solid #777;border-radius:7px;padding:10px;margin:9px 0}}.descriptor-row.added{{border-left-color:#27ae60;background:#123322}}.descriptor-row.unobserved{{border-left-color:#77818a;background:#242a30}}.descriptor-row.changed{{border-left-color:#d69e36;background:#332b18}}.descriptor-row.same{{border-left-color:#568c6b}}.descriptor-pair,.id-grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}}.descriptor-pair pre{{overflow-wrap:anywhere}}.decoded{{margin-top:7px;padding-left:20px;overflow-wrap:anywhere}}.diffline{{margin:10px 0;padding:8px;background:#0e1216;border-radius:5px}}pre{{white-space:pre-wrap;overflow-wrap:anywhere;background:#0e1216;padding:10px;border-radius:5px}}.note{{border-left:4px solid #c18d41;padding:10px;margin:12px 0}}@media(max-width:850px){{.comparegrid{{grid-template-columns:1fr}}.exchange-grid{{grid-template-columns:1fr}}}}
 </style></head><body>
 <h1>USB Research Toolkit — побайтовый отчёт кампании</h1><p class="meta">Кампания: {html.escape(report['campaign_dir'])}<br>PCAPNG: {html.escape(report['host_pcap'])}<br>Generated: {html.escape(report['created_utc'])}</p>
 <div class="note">Три источника: ожидаемые байты JSON-профиля; payload Raw Gadget; USBPcap host-stack. Для native USBPcap linktype 249 используется прямой разбор PCAPNG, анализ начинается с первой packet record. Cases сопоставляются с USB enumeration-сессиями по порядку и фактическим дескрипторам/endpoint payload, без сравнения часов Raspberry Pi и Windows. Это не электрический USB-анализатор.</div>
